@@ -6,6 +6,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <thread>
 
@@ -45,9 +46,31 @@ void log_line(const char* fmt, ...) {
     fprintf(stdout, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, msg);
     fflush(stdout);
     if (s_log) {
-        fprintf(s_log, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, msg);
-        fflush(s_log);
+        // A runaway error must not fill the disk: stop at 8 MB (the log is rotated at the next start)
+        static bool full = false;
+        if (!full && ftell(s_log) > (8L << 20)) {
+            full = true;
+            fprintf(s_log, "[%02d:%02d:%02d] log: over 8 MB, not writing more until the next start\n", st.wHour, st.wMinute, st.wSecond);
+            fflush(s_log);
+        }
+        if (!full) {
+            fprintf(s_log, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, msg);
+            fflush(s_log);
+        }
     }
+}
+
+// FFmpeg's own error messages (why an encoder call failed), capped so a repeating one can't flood the log
+static void ffmpeg_log(void* avcl, int level, const char* fmt, va_list vl) {
+    if (level > AV_LOG_ERROR) return;
+    static std::atomic<int> count{0};
+    if (count++ >= 40) return;
+    char line[512];
+    int prefix = 1;
+    av_log_format_line(avcl, level, fmt, vl, line, sizeof(line), &prefix);
+    size_t n = strlen(line);
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    if (n) log_line("ffmpeg: %s", line);
 }
 
 bool gpu_init() {
@@ -277,6 +300,7 @@ acquired:
     s_log = _wfsopen(logPath.c_str(), L"a", _SH_DENYWR);   // others may read the log while we run
 
     av_log_set_level(AV_LOG_WARNING);
+    av_log_set_callback(ffmpeg_log);
     log_line("VramReplay starting: %ds, %dfps, %lld Mbps, mic %s", g_config.seconds, g_config.fps,
         (long long)(g_config.bitrate / 1'000'000), g_config.captureMic ? "on" : "off");
     if (!gpu_init()) return 1;

@@ -415,6 +415,7 @@ static bool amf_loop() {
     int64_t lastFrameUs = 0, lastPts = 0;
     bool everWorked = false;
     int failures = 0;
+    int sendFails = 0, encResets = 0;
 
     while (g_running) {
         if (!cap.graph) {
@@ -479,9 +480,28 @@ static bool amf_loop() {
         f->color_primaries = AVCOL_PRI_BT709;
         f->color_trc = AVCOL_TRC_IEC61966_2_1;
         ret = avcodec_send_frame(enc.ctx, f);
-        if (ret < 0 && ret != AVERROR(EAGAIN)) log_line("video: send_frame failed %d", ret);
         drain_packets(enc);
         av_frame_free(&f);
+        if (ret < 0 && ret != AVERROR(EAGAIN)) {
+            // A broken encoder fails every frame. Log the start of a run only, and after half a second of it
+            // reopen capture and encoder; if that keeps happening, hand over to Desktop Duplication.
+            if (sendFails++ == 0) log_line("video: send_frame failed %d", ret);
+            if (sendFails >= g_config.fps / 2) {
+                sendFails = 0;
+                close_encoder(enc);
+                close_amf(cap);
+                if (++encResets >= 3) {
+                    log_line("video: the AMF encoder keeps failing on driver capture, switching to Desktop Duplication");
+                    return false;
+                }
+                log_line("video: encoder keeps failing, reopening capture and encoder (%d)", encResets);
+                Sleep(500);
+            }
+            continue;
+        }
+        if (sendFails) log_line("video: send_frame recovered after %d failures", sendFails);
+        sendFails = 0;
+        encResets = 0;
         frames++;
         announce_once();
         lastFrameUs = now_us();
@@ -592,7 +612,13 @@ static void dda_loop() {
             frame->color_primaries = AVCOL_PRI_BT709;
             frame->color_trc = AVCOL_TRC_IEC61966_2_1;
             int ret = avcodec_send_frame(enc.ctx, frame);
-            if (ret < 0 && ret != AVERROR(EAGAIN)) log_line("video: send_frame failed %d", ret);
+            static int ddaSendFails = 0;    // log the start of a failing run only, not every frame
+            if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                if (ddaSendFails++ == 0) log_line("video: send_frame failed %d", ret);
+            } else if (ddaSendFails) {
+                log_line("video: send_frame recovered after %d failures", ddaSendFails);
+                ddaSendFails = 0;
+            }
             drain_packets(enc);
             if (frames++ == 0 && !s_announced) {
                 // First frame of this process: the replay buffer is live
