@@ -1,0 +1,7 @@
+bin/
+build/
+ref/
+*.exe
+*.dll
+*.o
+*.bak
