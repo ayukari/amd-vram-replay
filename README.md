@@ -1,5 +1,7 @@
 # amd-vram-replay
 
+English | [日本語](README.ja.md)
+
 A tiny instant-replay recorder for Windows and AMD Radeon GPUs that keeps the replay buffer **in VRAM**.
 
 The screen is captured by the AMD driver itself (AMF DisplayCapture), with DXGI Desktop Duplication as a fallback. It is encoded on the GPU with AMD's AMF encoder (through FFmpeg), and the encoded packets go into one big `ID3D11Buffer` ring on the graphics card. Raw frames never touch system memory, and only the small encoded packets pass through it on their way in. Press a hotkey, and the last *N* seconds are read back and written to an MP4 with no re-encoding.
