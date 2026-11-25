@@ -8,6 +8,8 @@
 #include <wincodec.h>
 
 extern "C" {
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
 #include <libavutil/opt.h>
 }
 
@@ -222,20 +224,26 @@ static void close_encoder(Encoder& e) {
     av_packet_free(&e.pkt);
 }
 
-static bool open_encoder(Encoder& e, int width, int height) {
-    e.framesRef = av_hwframe_ctx_alloc(g_gpu.deviceRef);
-    auto* frames = (AVHWFramesContext*)e.framesRef->data;
-    frames->format = AV_PIX_FMT_D3D11;
-    frames->sw_format = AV_PIX_FMT_BGRA;   // AMF converts RGB to YUV on the GPU
-    frames->width = width;
-    frames->height = height;
-    // Like vsrc_ddagrab.c, leave initial_pool_size at 0 so every frame is its own texture.
-    // AMF on this driver encodes garbage from slices of a texture array.
-    frames->initial_pool_size = 0;
-    int ret = av_hwframe_ctx_init(e.framesRef);
-    if (ret < 0) {
-        log_line("video: av_hwframe_ctx_init failed %d", ret);
-        return false;
+// inputFrames: frames context of an upstream source (AMF driver capture); null for our own D3D11 texture pool
+static bool open_encoder(Encoder& e, int width, int height, AVBufferRef* inputFrames = nullptr) {
+    int ret;
+    if (inputFrames) {
+        e.framesRef = av_buffer_ref(inputFrames);
+    } else {
+        e.framesRef = av_hwframe_ctx_alloc(g_gpu.deviceRef);
+        auto* frames = (AVHWFramesContext*)e.framesRef->data;
+        frames->format = AV_PIX_FMT_D3D11;
+        frames->sw_format = AV_PIX_FMT_BGRA;   // AMF converts RGB to YUV on the GPU
+        frames->width = width;
+        frames->height = height;
+        // Like vsrc_ddagrab.c, leave initial_pool_size at 0 so every frame is its own texture.
+        // AMF on this driver encodes garbage from slices of a texture array.
+        frames->initial_pool_size = 0;
+        ret = av_hwframe_ctx_init(e.framesRef);
+        if (ret < 0) {
+            log_line("video: av_hwframe_ctx_init failed %d", ret);
+            return false;
+        }
     }
 
     const AVCodec* codec = avcodec_find_encoder_by_name(g_config.codec.c_str());
@@ -246,7 +254,7 @@ static bool open_encoder(Encoder& e, int width, int height) {
     e.ctx = avcodec_alloc_context3(codec);
     e.ctx->width = width;
     e.ctx->height = height;
-    e.ctx->pix_fmt = AV_PIX_FMT_D3D11;
+    e.ctx->pix_fmt = ((AVHWFramesContext*)e.framesRef->data)->format;   // D3D11 or AMF surfaces
     e.ctx->hw_frames_ctx = av_buffer_ref(e.framesRef);
     e.ctx->time_base = { 1, 1'000'000 };
     e.ctx->framerate = { g_config.fps, 1 };
@@ -294,7 +302,212 @@ static void drain_packets(Encoder& e) {
     }
 }
 
+// ---------- AMD driver capture (AMF DisplayCapture through FFmpeg's vsrc_amf) ----------
+// The same capture path Adrenalin's own recorder uses: the driver hands over the displayed surface, which goes
+// straight into the AMF encoder without a Desktop Duplication copy. Falls back to Desktop Duplication when the
+// driver or FFmpeg build doesn't offer it.
+
+struct AmfCapture {
+    AVFilterGraph* graph = nullptr;
+    AVFilterContext* src = nullptr;
+    AVFilterContext* sink = nullptr;
+};
+
+static void close_amf(AmfCapture& c) {
+    avfilter_graph_free(&c.graph);
+    c = AmfCapture{};
+}
+
+static bool open_amf(AmfCapture& c) {
+    const AVFilter* srcFilter = avfilter_get_by_name("vsrc_amf");
+    const AVFilter* sinkFilter = avfilter_get_by_name("buffersink");
+    if (!srcFilter || !sinkFilter) {
+        log_line("video: this FFmpeg build has no vsrc_amf");
+        return false;
+    }
+    c.graph = avfilter_graph_alloc();
+    c.src = avfilter_graph_alloc_filter(c.graph, srcFilter, "capture");
+    c.sink = avfilter_graph_alloc_filter(c.graph, sinkFilter, "out");
+    if (!c.src || !c.sink) return false;
+    // Derived from our D3D11 device, so captured surfaces live on the same device as everything else
+    c.src->hw_device_ctx = av_buffer_ref(g_gpu.deviceRef);
+    char rate[16];
+    snprintf(rate, sizeof(rate), "%d", g_config.fps);
+    av_opt_set_int(c.src, "monitor_index", g_config.monitor, AV_OPT_SEARCH_CHILDREN);
+    av_opt_set(c.src, "framerate", rate, AV_OPT_SEARCH_CHILDREN);
+    av_opt_set_int(c.src, "duplicate_output", 0, AV_OPT_SEARCH_CHILDREN);   // driver capture, not Desktop Duplication
+    int ret;
+    if ((ret = avfilter_init_str(c.src, nullptr)) < 0 || (ret = avfilter_init_str(c.sink, nullptr)) < 0 ||
+        (ret = avfilter_link(c.src, 0, c.sink, 0)) < 0 || (ret = avfilter_graph_config(c.graph, nullptr)) < 0) {
+        char err[128];
+        av_strerror(ret, err, sizeof(err));
+        if (!s_failLogged) log_line("video: AMF capture could not start: %s", err);
+        s_failLogged = true;
+        return false;
+    }
+    log_line("video: AMD driver capture of monitor %d at %dx%d", g_config.monitor, av_buffersink_get_w(c.sink), av_buffersink_get_h(c.sink));
+    s_failLogged = false;
+    return true;
+}
+
+// Screenshot from a captured AMF surface: downloaded on the capture thread (one short stall), PNG written elsewhere
+static void take_screenshot_frame(const AVFrame* f) {
+    // A read-only CPU mapping of the surface. (A transfer would Convert() the surface itself to host memory,
+    // and this surface still goes to the encoder afterwards.)
+    AVFrame* sw = av_frame_alloc();
+    int ret = av_hwframe_map(sw, f, AV_HWFRAME_MAP_READ);
+    if (ret < 0) {
+        // Fallback: download into the frames context's own software format
+        av_frame_unref(sw);
+        sw->format = ((AVHWFramesContext*)f->hw_frames_ctx->data)->sw_format;
+        ret = av_hwframe_transfer_data(sw, f, 0);
+    }
+    if (ret < 0 || (sw->format != AV_PIX_FMT_BGRA && sw->format != AV_PIX_FMT_BGR0 && sw->format != AV_PIX_FMT_RGBA &&
+                    sw->format != AV_PIX_FMT_RGB0)) {
+        log_line("screenshot: download failed (%d, format %d)", ret, sw->format);
+        av_frame_free(&sw);
+        toast(TOAST_ERROR, L"スクリーンショットを保存できませんでした", L"画像を読み出せませんでした");
+        return;
+    }
+    const bool rgb = sw->format == AV_PIX_FMT_RGBA || sw->format == AV_PIX_FMT_RGB0;
+    const int width = sw->width, height = sw->height;
+    std::vector<uint8_t> bgr((size_t)width * height * 3);
+    for (int y = 0; y < height; y++) {
+        const uint8_t* src = sw->data[0] + (size_t)y * sw->linesize[0];
+        uint8_t* dst = bgr.data() + (size_t)y * width * 3;
+        for (int x = 0; x < width; x++, src += 4, dst += 3) {
+            dst[0] = src[rgb ? 2 : 0];
+            dst[1] = src[1];
+            dst[2] = src[rgb ? 0 : 2];
+        }
+    }
+    av_frame_free(&sw);
+    std::wstring path = new_clip_path(L".png");
+    std::thread([bgr = std::move(bgr), path, width, height] {
+        if (!write_png(path, bgr.data(), width, height)) {
+            DeleteFileW(path.c_str());
+            log_line("screenshot: could not write the PNG");
+            toast(TOAST_ERROR, L"スクリーンショットを保存できませんでした", L"保存先に書き込めません");
+            return;
+        }
+        log_line("screenshot: %dx%d -> %s", width, height, wide_to_utf8(path).c_str());
+        if (g_config.saveSound) play_save_sound();
+        std::wstring app = clip_app_name(path);
+        wchar_t sub[128];
+        swprintf_s(sub, L"%s%s%d × %d", app.c_str(), app.empty() ? L"" : L" · ", width, height);
+        toast(TOAST_SHOT, L"スクリーンショットを保存しました", sub);
+    }).detach();
+}
+
+static void announce_once() {
+    if (s_announced) return;
+    s_announced = true;
+    wchar_t sub[96];
+    swprintf_s(sub, L"直近 %d 秒 · Ctrl+Alt+Shift+F10 で保存", g_config.seconds);
+    toast(TOAST_RECORD, L"リプレイの録画を開始しました", sub);
+}
+
+// Returns false if driver capture never worked, so the caller can fall back to Desktop Duplication
+static bool amf_loop() {
+    AmfCapture cap;
+    Encoder enc;
+    uint64_t frames = 0;
+    int64_t lastFrameUs = 0, lastPts = 0;
+    bool everWorked = false;
+    int failures = 0;
+
+    while (g_running) {
+        if (!cap.graph) {
+            if (!open_amf(cap)) {
+                close_amf(cap);
+                if (!everWorked && ++failures >= 2) {
+                    close_encoder(enc);
+                    return false;
+                }
+                Sleep(1000);
+                continue;
+            }
+            int w = av_buffersink_get_w(cap.sink), h = av_buffersink_get_h(cap.sink);
+            if (enc.ctx && (enc.ctx->width != w || enc.ctx->height != h)) {
+                record_stop(L"解像度が変わったため、ここで区切りました");
+                g_ring.clear();
+            }
+            // The encoder takes its surfaces from this graph's frames context, so it is reopened with it.
+            // Same size means the same stream parameters, so the replay ring carries on across the reopen.
+            if (enc.ctx) {
+                avcodec_send_frame(enc.ctx, nullptr);
+                drain_packets(enc);
+                close_encoder(enc);
+            }
+            if (!open_encoder(enc, w, h, av_buffersink_get_hw_frames_ctx(cap.sink))) {
+                close_encoder(enc);
+                close_amf(cap);
+                if (!everWorked && ++failures >= 2) return false;
+                Sleep(2000);
+                continue;
+            }
+            if (lastFrameUs && now_us() - lastFrameUs > 1'000'000) {
+                log_line("video: capture resumed after %.1f s, clearing the replay", (now_us() - lastFrameUs) / 1e6);
+                g_ring.clear();
+            }
+            frames = 0;     // a fresh encoder starts with an IDR
+        }
+
+        // vsrc_amf paces itself to the configured frame rate (keep_framerate mode)
+        AVFrame* f = av_frame_alloc();
+        int ret = av_buffersink_get_frame(cap.sink, f);
+        if (ret < 0) {
+            char err[128];
+            av_strerror(ret, err, sizeof(err));
+            log_line("video: AMF capture stopped (%s), reopening", err);
+            av_frame_free(&f);
+            close_amf(cap);
+            Sleep(200);
+            continue;
+        }
+        everWorked = true;
+        if (int64_t due = s_shotDueUs; due && now_us() >= due) {
+            s_shotDueUs = 0;
+            if (now_us() - due < 3'000'000) take_screenshot_frame(f);
+        }
+        int64_t pts = std::max(now_us(), lastPts + 1);
+        lastPts = pts;
+        f->pts = pts;
+        f->pict_type = g_forceIdr.exchange(false) || frames % g_config.fps == 0 ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+        f->color_range = AVCOL_RANGE_JPEG;
+        f->colorspace = AVCOL_SPC_RGB;
+        f->color_primaries = AVCOL_PRI_BT709;
+        f->color_trc = AVCOL_TRC_IEC61966_2_1;
+        ret = avcodec_send_frame(enc.ctx, f);
+        if (ret < 0 && ret != AVERROR(EAGAIN)) log_line("video: send_frame failed %d", ret);
+        drain_packets(enc);
+        av_frame_free(&f);
+        frames++;
+        announce_once();
+        lastFrameUs = now_us();
+    }
+
+    if (enc.ctx) {
+        avcodec_send_frame(enc.ctx, nullptr);
+        drain_packets(enc);
+    }
+    close_encoder(enc);
+    close_amf(cap);
+    log_line("video: stopped after %llu frames", (unsigned long long)frames);
+    return true;
+}
+
+static void dda_loop();
+
 static void video_loop() {
+    if (g_config.capture != "dda") {
+        if (amf_loop()) return;
+        log_line("video: AMD driver capture unavailable, using Desktop Duplication");
+    }
+    dda_loop();
+}
+
+static void dda_loop() {
     // High resolution waitable timer for frame pacing without spinning
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     Capture cap;

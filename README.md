@@ -2,7 +2,7 @@
 
 A tiny instant-replay recorder for Windows and AMD Radeon GPUs that keeps the replay buffer **in VRAM**.
 
-The desktop is captured with DXGI Desktop Duplication, encoded on the GPU with AMD's AMF encoder (through FFmpeg), and the encoded packets go into one big `ID3D11Buffer` ring on the graphics card. Raw frames never touch system memory, and only the small encoded packets pass through it on their way in. Press a hotkey, and the last *N* seconds are read back and written to an MP4 with no re-encoding.
+The screen is captured by the AMD driver itself (AMF DisplayCapture), with DXGI Desktop Duplication as a fallback. It is encoded on the GPU with AMD's AMF encoder (through FFmpeg), and the encoded packets go into one big `ID3D11Buffer` ring on the graphics card. Raw frames never touch system memory, and only the small encoded packets pass through it on their way in. Press a hotkey, and the last *N* seconds are read back and written to an MP4 with no re-encoding.
 
 The idea is the same as ShadowPlay's or Adrenalin's Instant Replay, built from FFmpeg's libraries instead of a vendor app.
 
@@ -10,6 +10,7 @@ The app's UI is in Japanese.
 
 ## Features
 
+- **AMD driver capture**: frames come straight from the display driver (AMF DisplayCapture via FFmpeg's `vsrc_amf`) into the encoder, the same path Adrenalin uses. Desktop Duplication is the fallback (`--capture=dda` forces it).
 - **Instant replay**: keeps the last 5 to 180 seconds (default 30) and saves them with `Ctrl+Alt+Shift+F10`.
   - Clips are named after the game in front, for example `Overwatch_2026-11-25_07-46-47.mp4`.
 - **Manual recording**: `Ctrl+Alt+Shift+F11` starts and stops a recording that is written to disk as it goes.
@@ -89,7 +90,8 @@ $w = New-Object IO.StreamWriter($c); $w.AutoFlush = $true; $w.Write('save')
 ## How it works
 
 ```
-Desktop Duplication ─► D3D11 texture ─► h264_amf (GPU colour conversion + encode)
+AMD driver capture (vsrc_amf) ─────────► h264_amf (GPU colour conversion + encode)
+  └ fallback: Desktop Duplication ─► D3D11 texture ─┘
                                               │ encoded packets
 WASAPI loopback + mic ─► resample/mix ─► AAC ─┤
                                               ▼

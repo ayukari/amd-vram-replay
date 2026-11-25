@@ -27,6 +27,7 @@ struct Config {
     int fps = 60;
     int monitor = 0;
     std::string codec = "h264_amf";
+    std::string capture = "auto";   // "auto": AMD driver capture, falling back to Desktop Duplication; "dda": always DDA
     int64_t bitrate = 25'000'000;
     int64_t maxrate = 40'000'000;
     double micGain = 1.0;

@@ -107,6 +107,7 @@ static void parse_args(int argc, wchar_t** argv) {
         else if (key == L"fps") g_config.fps = std::stoi(val);
         else if (key == L"monitor") g_config.monitor = std::stoi(val);
         else if (key == L"codec") g_config.codec = wide_to_utf8(val);
+        else if (key == L"capture") g_config.capture = wide_to_utf8(val);
         else if (key == L"bitrate") g_config.bitrate = (int64_t)(std::stod(val) * 1'000'000);
         else if (key == L"maxrate") g_config.maxrate = (int64_t)(std::stod(val) * 1'000'000);
         else if (key == L"mic-gain") g_config.micGain = std::stod(val);

@@ -13,11 +13,11 @@ mkdir -p bin build
     -municode -mwindows -DUNICODE -D_UNICODE \
     -I"$FF/include" \
     src/main.cpp src/video.cpp src/audio.cpp src/ring.cpp src/saver.cpp src/tray.cpp src/mux.cpp src/recorder.cpp src/overlay.cpp build/app.res.o \
-    -L"$FF/lib" -lavformat -lavcodec -lswresample -lavutil \
+    -L"$FF/lib" -lavformat -lavcodec -lavfilter -lswresample -lavutil \
     -ld3d11 -ldxgi -lole32 -luuid -lwinmm -lshell32 -luser32 -lgdi32 -ladvapi32 -lversion -lwindowscodecs \
     -static-libstdc++ -static-libgcc \
     -o bin/VramReplay.exe
-cp -u "$FF"/bin/avformat-*.dll "$FF"/bin/avcodec-*.dll "$FF"/bin/avutil-*.dll "$FF"/bin/swresample-*.dll bin/
+cp -u "$FF"/bin/avformat-*.dll "$FF"/bin/avfilter-*.dll "$FF"/bin/avcodec-*.dll "$FF"/bin/avutil-*.dll "$FF"/bin/swresample-*.dll bin/
 # avcodec/avformat pull in these at load time as well
 cp -u "$FF"/bin/swscale-*.dll bin/ 2>/dev/null || true
 echo "built bin/VramReplay.exe"
