@@ -1,6 +1,6 @@
 # amd-vram-replay
 
-English | [日本語](README.ja.md)
+English | [日本語](README.ja.md) · Download (Windows zip): [BOOTH](https://4yubootg.booth.pm/items/9218665)
 
 A tiny instant-replay recorder for Windows and AMD Radeon GPUs that keeps the replay buffer **in VRAM**.
 

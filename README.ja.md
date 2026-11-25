@@ -1,6 +1,6 @@
 # amd-vram-replay
 
-[English](README.md) | 日本語
+[English](README.md) | 日本語 · ダウンロード（Windows 用 zip）: [BOOTH](https://4yubootg.booth.pm/items/9218665)
 
 Windows と AMD Radeon 用の小さなインスタントリプレイ録画ツールです。リプレイの録画データを **VRAM（グラフィックボードのメモリ）** に置いておきます。
 
